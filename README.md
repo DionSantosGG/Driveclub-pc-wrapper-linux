@@ -7,8 +7,6 @@ A personal hobby fork of the shadPS4 PS4 emulator, tuned
 to run Driveclub (CUSA00093, v1.28) on Windows. It is built on
 GR2fork by junminlee2004.
 
-Contributions and Credits
-
 This fork was created to help bring this project and build to Linux users.
 
     Game log files on this build are located at log/shad_log.txt and log/shadps4.log (instead of log/CUSA00093.log).
