@@ -4,6 +4,10 @@
 #pragma once
 
 #include <condition_variable>
+#include <deque>
+#include <thread>
+#include "video_core/renderer_vulkan/vk_frame_gen.h"
+#include "video_core/renderer_vulkan/vk_hudless_capture.h"
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
@@ -39,6 +43,7 @@ struct Frame {
     u8 id{};
 
     ImTextureID imgui_texture;
+    std::shared_ptr<HudlessSnapshot> hudless;
 };
 
 enum SchedulerType {
@@ -83,14 +88,7 @@ public:
     }
 
     VideoCore::Image& RegisterVideoOutSurface(
-        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
-        vo_buffers_addr.emplace_back(cpu_address);
-        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-        const auto image_id = texture_cache.FindImage(desc);
-        auto& image = texture_cache.GetImage(image_id);
-        image.usage.vo_surface = 1u;
-        return image;
-    }
+        const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address);
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
 
@@ -104,6 +102,34 @@ public:
 
 private:
     Frame* GetRenderFrame();
+    void StartPacedPresent();
+    void WaitPacedPresent();
+    bool GenerateFrame(Frame* frame, bool eligible);
+    void DumpFgPair(Frame* frame);
+    void PrepareHudless(Frame* frame, VAddr address, vk::Format view_format,
+                        bool srgb_encoded, int aa);
+    void RecordGuiFrame(Frame* frame, vk::Image source, ImTextureID texture,
+                        bool is_reusing_frame, bool screenshots);
+    std::unique_ptr<FrameGenerator> frame_gen;
+    std::chrono::steady_clock::time_point fg_last_real{}, fg_report_start{};
+    float fg_interval_ms = 16.667f;
+    bool fg_active = false;
+    struct PacedJob {
+        u32 gen_index{}, real_index{};
+        u64 gen_tick{}, real_tick{};
+        std::chrono::microseconds half{};
+    };
+    PacedJob fg_next_job{};
+    std::thread fg_pacer;
+    std::mutex fg_mutex;
+    std::condition_variable fg_cv;
+    std::deque<PacedJob> fg_jobs;
+    bool fg_stop = false, fg_present_failed = false;
+    u64 fg_real_count{}, fg_present_count{}, fg_pairs{}, fg_hudless_count{};
+    double fg_gen_to_real_ms{}, fg_real_to_gen_ms{};
+    std::chrono::steady_clock::time_point fg_real_at{};
+    int fg_dump_left = 0, fg_dump_index = 0;
+    int fg_dump_stage = 0;
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 

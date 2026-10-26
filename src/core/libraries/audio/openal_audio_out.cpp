@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -33,6 +34,8 @@
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/openal_manager.h"
 #include "core/libraries/kernel/threads.h"
+#include "driveclub/audio_queue.h"
+#include "driveclub/audio_stats.h"
 
 // SIMD support detection
 #if defined(__x86_64__) || defined(_M_X64)
@@ -118,21 +121,34 @@ public:
             FoldLfeIntoFronts();
         }
 
-        // Reclaim processed buffers
-        ALint processed = 0;
-        alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+        ReclaimProcessedBuffers();
 
-        while (processed > 0) {
-            ALuint buffer_id;
-            alSourceUnqueueBuffers(source, 1, &buffer_id);
-            if (alGetError() == AL_NO_ERROR) {
-                available_buffers.push_back(buffer_id);
-                processed--;
-            } else {
-                break;
+        if (DriveclubPC::AudioBufferingEnabled()) {
+            ALint before_queue = 0;
+            alGetSourcei(source, AL_SOURCE_STATE, &before_queue);
+            if (before_queue == AL_STOPPED) {
+                // driveclub-pc: stopped sources consider all queued buffers processed. Rewind
+                // only after reclaiming them, so newly queued packets can accumulate safely.
+                ReclaimProcessedBuffers();
+                alSourceRewind(source);
+            }
+            // driveclub-pc: catching up after a scheduling stall must not silently drop PCM.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+            while (available_buffers.empty() && std::chrono::steady_clock::now() < deadline) {
+                ALint state = 0;
+                alGetSourcei(source, AL_SOURCE_STATE, &state);
+                if (state != AL_PLAYING) {
+                    alSourcePlay(source);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                ReclaimProcessedBuffers();
+            }
+            if (available_buffers.empty()) {
+                LOG_ERROR(Lib_AudioOut, "OpenAL queue did not drain within 100 ms");
             }
         }
 
+        const bool dropped = available_buffers.empty();
         // Queue buffer
         if (!available_buffers.empty()) {
             ALuint buffer_id = available_buffers.back();
@@ -154,7 +170,17 @@ public:
         alGetSourcei(source, AL_SOURCE_STATE, &state);
         alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
 
-        if (state != AL_PLAYING && queued > 0) {
+        const bool restart =
+            state != AL_PLAYING &&
+            queued >= (DriveclubPC::AudioBufferingEnabled()
+                           ? DriveclubPC::AudioRecoveryPackets(buffer_frames, sample_rate)
+                           : 1);
+        stats.Record(use_native_float ? static_cast<const void*>(al_buffer_float.data())
+                                      : static_cast<const void*>(al_buffer_s16.data()),
+                     buffer_frames, downmix_to_stereo ? 2 : num_channels, sample_rate,
+                     use_native_float, queued * buffer_frames, restart, dropped);
+
+        if (restart) {
             LOG_DEBUG(Lib_AudioOut, "Audio underrun detected (queued: {}), restarting source",
                       queued);
             alSourcePlay(source);
@@ -215,6 +241,20 @@ public:
     }
 
 private:
+    void ReclaimProcessedBuffers() {
+        ALint processed = 0;
+        alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+        while (processed-- > 0) {
+            ALuint buffer_id;
+            alSourceUnqueueBuffers(source, 1, &buffer_id);
+            if (alGetError() != AL_NO_ERROR) {
+                LOG_ERROR(Lib_AudioOut, "Failed to reclaim processed OpenAL buffer");
+                break;
+            }
+            available_buffers.push_back(buffer_id);
+        }
+    }
+
     bool Initialize(OrbisAudioOutPort type) {
         // Register this port with the device manager
         if (!OpenALDevice::GetInstance().RegisterPort(device_name)) {
@@ -315,7 +355,7 @@ private:
         alSourcef(source, AL_GAIN, current_gain.load(std::memory_order_relaxed));
 
         // Prime buffers with silence
-        if (use_native_float) {
+        if (!DriveclubPC::AudioBufferingEnabled() && use_native_float) {
             std::vector<float> silence(buffer_frames * num_channels, 0.0f);
             for (size_t i = 0; i < buffers.size() - 1; i++) {
                 ALuint buffer_id = available_buffers.back();
@@ -323,7 +363,7 @@ private:
                 alBufferData(buffer_id, format, silence.data(), buffer_size_bytes, sample_rate);
                 alSourceQueueBuffers(source, 1, &buffer_id);
             }
-        } else {
+        } else if (!DriveclubPC::AudioBufferingEnabled()) {
             std::vector<s16> silence(buffer_frames * num_channels, 0);
             for (size_t i = 0; i < buffers.size() - 1; i++) {
                 ALuint buffer_id = available_buffers.back();
@@ -333,7 +373,9 @@ private:
             }
         }
 
-        alSourcePlay(source);
+        if (!DriveclubPC::AudioBufferingEnabled()) {
+            alSourcePlay(source);
+        }
 
         LOG_INFO(Lib_AudioOut,
                  "Initialized OpenAL backend ({} Hz, {} ch, {} format, {}) for device '{}'",
@@ -546,7 +588,11 @@ private:
             return false;
         }
 
-        buffers.resize(NUM_BUFFERS);
+        buffers.resize(
+            DriveclubPC::AudioBufferingEnabled()
+                ? std::max<u32>(NUM_BUFFERS,
+                                DriveclubPC::AudioRecoveryPackets(buffer_frames, sample_rate) + 2)
+                : NUM_BUFFERS);
         alGenBuffers(static_cast<ALsizei>(buffers.size()), buffers.data());
         if (alGetError() != AL_NO_ERROR) {
             LOG_ERROR(Lib_AudioOut, "Failed to generate OpenAL buffers");
@@ -1073,6 +1119,7 @@ private:
 
     std::string device_name;
     bool device_registered;
+    DriveclubPC::AudioStats stats{"OpenAL"};
 };
 
 std::unique_ptr<PortBackend> OpenALAudioOut::Open(PortOut& port) {

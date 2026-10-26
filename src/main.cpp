@@ -70,6 +70,7 @@ int main(int argc, char* argv[]) {
     bool bigPicture = false;
     bool sameProcess = false;
     bool append_log{};
+    bool check_only = false;
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
@@ -104,6 +105,8 @@ int main(int argc, char* argv[]) {
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
     app.add_flag("--log-append", append_log);
+    // driveclub-pc: support diagnostics without booting the game or opening error dialogs.
+    app.add_flag("--dcpc-check", check_only, "Check game, firmware and save path without booting");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
@@ -185,7 +188,9 @@ int main(int argc, char* argv[]) {
         }
         gamePath = chosen->string();
     } else {
-        DriveclubPC::Launcher::ApplySavedRuntimeOptions();
+        if (!DriveclubPC::Launcher::ApplySavedRuntimeOptions(check_only)) {
+            return 1;
+        }
     }
 
     if (!gamePath.has_value()) {
@@ -260,7 +265,12 @@ int main(int argc, char* argv[]) {
             }
         }
         if (!found) {
-            DriveclubPC::ShowError(fmt::format("Game folder not found:\n{}", *gamePath));
+            const auto message = fmt::format("Game folder not found:\n{}", *gamePath);
+            if (check_only) {
+                fmt::print(stderr, "{}\n", message);
+            } else {
+                DriveclubPC::ShowError(message);
+            }
             return 1;
         }
     }
@@ -269,14 +279,28 @@ int main(int argc, char* argv[]) {
     std::string launch_error;
     const auto driveclub_eboot = DriveclubPC::ResolveAndValidateGame(ebootPath, launch_error);
     if (!driveclub_eboot) {
+        if (check_only) {
+            fmt::print(stderr, "{}\n", launch_error);
+        } else {
+            DriveclubPC::ShowError(launch_error);
+        }
+        return 1;
+    }
+    const auto driveclub_title = DriveclubPC::ReadGameTitleId(*driveclub_eboot).value_or(
+        std::string(DriveclubPC::TitleId));
+    if (check_only) {
+        const auto report = DriveclubPC::InspectSysModules(driveclub_title);
+        const auto root = EmulatorSettings.GetSaveDataHome().u8string();
+        fmt::print("{}\n{}\n{}\nSave data root: {}\nSave layout: <root>/<user-id>/savedata/{}\n",
+                   DriveclubPC::GameCompatibilityNote(driveclub_title), report.summary,
+                   report.details, std::string(root.begin(), root.end()), driveclub_title);
+        return report.ready ? 0 : 1;
+    }
+    if (!DriveclubPC::ValidateSysModules(launch_error, driveclub_title)) {
         DriveclubPC::ShowError(launch_error);
         return 1;
     }
-    if (!DriveclubPC::ValidateSysModules(launch_error)) {
-        DriveclubPC::ShowError(launch_error);
-        return 1;
-    }
-    DriveclubPC::EnsureDefaultGameConfig();
+    DriveclubPC::EnsureDefaultGameConfig(driveclub_title);
     ebootPath = *driveclub_eboot;
 
     auto* emulator = Common::Singleton<Core::Emulator>::Instance();

@@ -14,6 +14,8 @@
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
+#include "driveclub/audio_queue.h"
+#include "driveclub/audio_stats.h"
 
 // SIMD support detection
 #if defined(__x86_64__) || defined(_M_X64)
@@ -86,12 +88,30 @@ public:
         convert(ptr, internal_buffer, buffer_frames, nullptr);
         HandleTiming(current_time);
 
-        if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
+        const bool inspect_queue = (output_count++ & 0xF) == 0;
+        if (DriveclubPC::AudioStats::Enabled()) {
+            const auto queued = SDL_GetAudioStreamQueued(stream);
+            const u32 channels = ps4_downmix ? 2 : num_channels;
+            stats.Record(internal_buffer, buffer_frames, channels, sample_rate, true,
+                         queued > 0 ? queued / (sizeof(float) * channels) : 0,
+                         inspect_queue && queued >= queue_threshold, false);
+        }
+        if (inspect_queue) { // Check every 16 outputs
             ManageAudioQueue();
         }
 
         if (!SDL_PutAudioStreamData(stream, internal_buffer, internal_buffer_size)) [[unlikely]] {
             LOG_ERROR(Lib_AudioOut, "Failed to output to SDL audio stream: {}", SDL_GetError());
+        }
+        const auto startup_bytes = DriveclubPC::AudioStartupFrames(sample_rate) * sizeof(float) *
+                                   (ps4_downmix ? 2 : num_channels);
+        const auto startup_queued = playback_started ? 0 : SDL_GetAudioStreamQueued(stream);
+        if (!playback_started && startup_queued >= 0 &&
+            static_cast<size_t>(startup_queued) >= startup_bytes) {
+            playback_started = SDL_ResumeAudioStreamDevice(stream);
+            if (!playback_started) {
+                LOG_ERROR(Lib_AudioOut, "Failed to start buffered SDL stream: {}", SDL_GetError());
+            }
         }
 
         last_output_time.store(current_time, std::memory_order_release);
@@ -313,12 +333,13 @@ private:
         }
 
         // Start playback
-        if (!SDL_ResumeAudioStreamDevice(stream)) {
+        if (!DriveclubPC::AudioBufferingEnabled() && !SDL_ResumeAudioStreamDevice(stream)) {
             LOG_ERROR(Lib_AudioOut, "Failed to resume audio stream: {}", SDL_GetError());
             SDL_DestroyAudioStream(stream);
             stream = nullptr;
             return false;
         }
+        playback_started = !DriveclubPC::AudioBufferingEnabled();
 
         LOG_INFO(Lib_AudioOut, "Opened audio device: {} ({} Hz, {} ch, gain: {:.3f})", device_name,
                  sample_rate, num_channels, initial_gain);
@@ -493,8 +514,16 @@ private:
             LOG_WARNING(Lib_AudioOut, "Failed to get SDL buffer size: {}", SDL_GetError());
         }
 
-        const u32 sdl_buffer_size = sdl_buffer_frames * sizeof(float) * num_channels;
-        queue_threshold = std::max(guest_buffer_size, sdl_buffer_size) * QUEUE_MULTIPLIER;
+        const u32 channels = ps4_downmix ? 2 : num_channels;
+        const u32 sdl_buffer_size = sdl_buffer_frames * sizeof(float) * channels;
+        const u32 legacy_buffer_size = sdl_buffer_frames * sizeof(float) * num_channels;
+        const u32 startup_buffer_size =
+            DriveclubPC::AudioStartupFrames(sample_rate) * sizeof(float) * channels;
+        queue_threshold =
+            DriveclubPC::AudioBufferingEnabled()
+                ? std::max({internal_buffer_size, sdl_buffer_size, startup_buffer_size}) *
+                      QUEUE_MULTIPLIER
+                : std::max(guest_buffer_size, legacy_buffer_size) * QUEUE_MULTIPLIER;
 
         LOG_DEBUG(Lib_AudioOut, "Audio queue threshold: {} bytes (SDL buffer: {} frames)",
                   queue_threshold, sdl_buffer_frames);
@@ -653,7 +682,9 @@ private:
 
     // SDL audio stream
     SDL_AudioStream* stream{nullptr};
+    bool playback_started{false};
     u32 queue_threshold{0};
+    DriveclubPC::AudioStats stats{"SDL"};
 };
 
 std::unique_ptr<PortBackend> SDLAudioOut::Open(PortOut& port) {

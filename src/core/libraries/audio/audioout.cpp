@@ -18,6 +18,8 @@
 #include "core/libraries/audio/audioout_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "driveclub/audio_queue.h"
+#include "driveclub/audio_stats.h"
 
 namespace Libraries::AudioOut {
 
@@ -168,27 +170,60 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         Common::SetCurrentThreadName(thread_name.c_str());
     }
 
-    Common::AccurateTimer timer(
-        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate));
+    const auto interval =
+        std::chrono::nanoseconds(1000000000ULL * port->buffer_frames / port->sample_rate);
+    Common::AccurateTimer timer(interval);
+    bool has_output = false;
+    u64 stats_start = Kernel::sceKernelGetProcessTime();
+    u64 ready_ticks = 0, empty_ticks = 0;
 
     while (true) {
         timer.Start();
 
         {
             std::unique_lock lock{port->mutex};
-            if (!port->impl || stop.stop_requested()) {
+            if (DriveclubPC::AudioBufferingEnabled()) {
+                const auto wait_start = std::chrono::steady_clock::now();
+                // driveclub-pc: a late packet must wake us, not lose an entire polling period.
+                port->input_cv.wait(
+                    lock, stop, [&] { return port->output_ready || port->closing || !port->impl; });
+                if (!has_output ||
+                    std::chrono::steady_clock::now() - wait_start >
+                        std::chrono::milliseconds(100) ||
+                    timer.GetTotalWait() < -std::chrono::milliseconds(100)) {
+                    timer = Common::AccurateTimer(interval);
+                    timer.Start();
+                }
+            }
+            if (!port->impl || stop.stop_requested() || port->closing) {
                 break;
             }
 
             if (port->output_ready) {
+                ++ready_ticks;
                 port->impl->Output(port->output_buffer);
                 port->output_ready = false;
+                has_output = true;
                 port->last_output_time =
                     Kernel::sceKernelGetProcessTime(); // moved from sceAudioOutOutput TOOD recheck
+            } else {
+                ++empty_ticks;
             }
         }
 
         port->output_cv.notify_all();
+        if (DriveclubPC::AudioStats::Enabled()) {
+            const auto now = Kernel::sceKernelGetProcessTime();
+            if (now - stats_start >= 5'000'000) {
+                LOG_INFO(
+                    Lib_AudioOut,
+                    "driveclub-pc: audio worker port={} frames={} ready={} empty={} seconds={:.3f}",
+                    fmt::ptr(port.get()), port->buffer_frames, ready_ticks, empty_ticks,
+                    (now - stats_start) / 1'000'000.0);
+                stats_start = now;
+                ready_ticks = empty_ticks = 0;
+            }
+        }
 
         if (stop.stop_requested()) {
             break;
@@ -203,6 +238,7 @@ static void AudioOutputThread(std::shared_ptr<PortOut> port, const std::stop_tok
         port->output_ready = false;
     }
     port->output_cv.notify_all();
+    port->input_cv.notify_all();
 }
 
 /*
@@ -414,6 +450,7 @@ s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
     port->output_cv.notify_all();
 
     // Stop the output thread.
+    port->input_cv.notify_all();
     port->output_thread.Stop();
 
     {
@@ -586,6 +623,9 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         }
     }
 
+    if (ptr != nullptr) {
+        port->input_cv.notify_one();
+    }
     return samples_sent;
 }
 
@@ -688,6 +728,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
+            ports[i]->input_cv.notify_one();
         }
     }
 

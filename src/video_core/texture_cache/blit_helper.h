@@ -31,14 +31,21 @@ public:
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, vk::Image source, vk::Image dest);
 
+    void ReinterpretMsDepthAsColor(u32 width, u32 height, vk::Format src_pixel_format,
+                                   vk::Format dst_pixel_format, vk::Image source, vk::Image dest);
+
 private:
     void CreateShaders();
     void CreatePipelineLayouts();
 
+    enum class CopyMode { SingleSample, Multisample, PackDepthSamples };
+    void CopyToColor(u32 width, u32 height, u32 num_samples, vk::Format src_pixel_format,
+                     vk::Format dst_pixel_format, CopyMode mode, vk::Image source, vk::Image dest);
+
     struct MsPipelineKey {
         u32 num_samples;
         vk::Format attachment_format;
-        bool src_msaa;
+        CopyMode mode;
 
         auto operator<=>(const MsPipelineKey&) const noexcept = default;
     };
@@ -54,6 +61,7 @@ private:
     vk::ShaderModule color_to_ms_depth_frag;
     vk::ShaderModule src_msaa_copy_frag;
     vk::ShaderModule src_non_msaa_copy_frag;
+    vk::ShaderModule ms_depth_pack_frag;
 
     using MsPipeline = std::pair<MsPipelineKey, vk::UniquePipeline>;
     std::vector<MsPipeline> color_to_ms_depth_pl;

@@ -30,6 +30,7 @@
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_hudless_capture.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -107,6 +108,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    if (HudlessCapture::Enabled()) hudless_capture = std::make_unique<HudlessCapture>(instance);
     scheduler.EnableDeferredRecording();
     scheduler.EnableAsyncSubmit();
     auto& skipcache = Skipcache::Framework::Instance();
@@ -210,6 +212,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+}
+
+void Rasterizer::RegisterFgVideoOut(VAddr address) {
+    if (hudless_capture) hudless_capture->Register(address);
+}
+std::shared_ptr<HudlessSnapshot> Rasterizer::TakeHudless(VAddr address) {
+    return hudless_capture ? hudless_capture->Take(address) : nullptr;
 }
 
 Rasterizer::~Rasterizer() {
@@ -634,6 +643,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     } else {
         glue_entry_miss_ += glue_mode_ != 0 && !glue;
         rt_ok = PrepareRenderState(pipeline);
+    }
+    if (hudless_capture && cb_descs[0].image_id) {
+        hudless_capture->OnDraw(scheduler, runtime, texture_cache.GetImage(cb_descs[0].image_id),
+                                regs.color_buffers[0].Address());
     }
     if (!BindResources(pipeline)) {
         return;

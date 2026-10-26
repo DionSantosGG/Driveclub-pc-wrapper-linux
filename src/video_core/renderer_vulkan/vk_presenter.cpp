@@ -450,6 +450,30 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 
     const auto& primary_path = readback.paths.front();
+    // driveclub-pc: FG dumps must retain evidence hidden by the normal opaque PNG conversion.
+    // The SDK leaves the inpainting weight in alpha where its final pass has no work.
+    if (readback.format == vk::Format::eR8G8B8A8Unorm &&
+        primary_path.filename().string().ends_with("-gen.png")) {
+        auto alpha = rgba;
+        auto formerly_blended = rgba;
+        size_t nonopaque = 0;
+        const auto* pixels = readback.buffer.mapped_data.data();
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            const u8 a = pixels[i + 3];
+            nonopaque += a != 255;
+            for (size_t c = 0; c < 3; ++c) {
+                alpha[i + c] = a;
+                formerly_blended[i + c] = u8((u32(rgba[i + c]) * a + 127) / 255);
+            }
+        }
+        auto path = primary_path;
+        path.replace_filename(primary_path.stem().string() + "-alpha.png");
+        WritePng(path, alpha, readback.width, readback.height);
+        path.replace_filename(primary_path.stem().string() + "-old-black-blend.png");
+        WritePng(path, formerly_blended, readback.width, readback.height);
+        LOG_INFO(Render_Vulkan, "driveclub-pc: FG raw alpha nonopaque {}/{} pixels; display forces alpha 1",
+                 nonopaque, rgba.size() / 4);
+    }
     if (!WritePng(primary_path, rgba, readback.width, readback.height)) {
         LOG_ERROR(Render_Vulkan, "Failed saving screenshot to {}", primary_path.string());
         return;
@@ -535,6 +559,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    WaitPacedPresent();
+    if (fg_pacer.joinable()) {
+        { std::scoped_lock lock{fg_mutex}; fg_stop = true; }
+        fg_cv.notify_all();
+        fg_pacer.join();
+    }
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();
@@ -543,6 +573,7 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
+    frame_gen.reset();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
@@ -699,6 +730,17 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+VideoCore::Image& Presenter::RegisterVideoOutSurface(
+    const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
+    vo_buffers_addr.emplace_back(cpu_address);
+    rasterizer->RegisterFgVideoOut(cpu_address);
+    auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+    const auto image_id = texture_cache.FindImage(desc);
+    auto& image = texture_cache.GetImage(image_id);
+    image.usage.vo_surface = 1u;
+    return image;
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
@@ -832,6 +874,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
+    PrepareHudless(frame, cpu_address, view_info.format, srgb_encoded, selected_aa);
+
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
 
@@ -932,6 +976,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // driveclub-pc: drain the previous pair before acquire/recreate and notification redraws.
+    WaitPacedPresent();
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -941,6 +987,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             free_cv.notify_one();
         }
     };
+
+    if (window.GetWidth() == 0 || window.GetHeight() == 0) {
+        fg_active = false;
+        free_frame();
+        return;
+    }
 
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
@@ -964,6 +1016,125 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
+    const bool generated = GenerateFrame(frame, is_game_frame && !is_reusing_frame &&
+        !Libraries::SystemService::IsSplashVisible() && !swapchain.GetHDR());
+    if (generated && !swapchain.AcquireNextImage()) {
+        // An acquire failure must retire the already-acquired generated image before recreation.
+        { std::scoped_lock lock{Scheduler::submit_mutex};
+          swapchain.PresentImage(fg_next_job.gen_index); }
+        SubmitInfo release{};
+        release.AddSignal(frame->present_done);
+        present_scheduler.Flush(release);
+        fg_active = false;
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        free_frame();
+        return;
+    }
+
+    RecordGuiFrame(frame, frame->image, frame->imgui_texture, is_reusing_frame, true);
+    auto& scheduler = present_scheduler;
+
+    SubmitInfo info{};
+    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    info.AddSignal(frame->present_done);
+    const u64 real_tick = scheduler.CurrentTick();
+    scheduler.Flush(info);
+
+    // Present to swapchain.
+    if (generated) {
+        fg_next_job.real_index = swapchain.ImageIndex();
+        fg_next_job.real_tick = real_tick;
+        swapchain.AdvanceAcquire();
+        StartPacedPresent();
+    } else {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        const u64 hold_start =
+            DriveclubPC::Profiler::Enabled() ? DriveclubPC::Profiler::NowNs() : 0;
+        if (!swapchain.Present()) {
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
+        if (hold_start) {
+            DriveclubPC::Profiler::AddMax(DriveclubPC::Profiler::MaxStat::PresentHold,
+                                          DriveclubPC::Profiler::NowNs() - hold_start);
+        }
+    }
+
+    free_frame();
+    if (!is_reusing_frame && is_game_frame) {
+        DebugState.IncFlipFrameNum();
+        DriveclubPC::Performance::OnGuestFrame();
+        DriveclubPC::Profiler::OnGuestFrame();
+    }
+}
+
+void Presenter::PrepareHudless(Frame* frame, VAddr address, vk::Format view_format,
+                               bool srgb_encoded, int selected_aa) {
+    auto snapshot = rasterizer->TakeHudless(address);
+    if (!snapshot || frame->is_hdr)
+        return;
+    const auto device = instance.GetDevice();
+    if (!snapshot->native_view || snapshot->view_format != view_format) {
+        snapshot->native_view = Check(device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = vk::Image(snapshot->native),
+            .viewType = vk::ImageViewType::e2D,
+            .format = view_format,
+            .components = {.a = vk::ComponentSwizzle::eOne},
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+        snapshot->view_format = view_format;
+    }
+    const vk::Extent2D size{frame->width, frame->height};
+    const auto format = swapchain.GetSurfaceFormat().format;
+    if (!snapshot->prepared_view || snapshot->prepared_size != size ||
+        snapshot->prepared_format != format) {
+        snapshot->prepared_view.reset();
+        snapshot->prepared.Destroy();
+        snapshot->prepared = VideoCore::UniqueImage(device, instance.GetAllocator());
+        snapshot->prepared.Create(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = {size.width, size.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment |
+                     vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled});
+        snapshot->prepared_view = Check(device.createImageViewUnique(vk::ImageViewCreateInfo{
+            .image = vk::Image(snapshot->prepared),
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+        snapshot->prepared_size = size;
+        snapshot->prepared_format = format;
+    }
+    const auto cmd = draw_scheduler.CommandBuffer();
+    const vk::ImageMemoryBarrier2 target{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = vk::Image(snapshot->prepared),
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &target});
+    auto view = aa_pass.Render(cmd, *snapshot->native_view, snapshot->native_size, selected_aa,
+                               srgb_encoded);
+    view = fsr_pass.Render(cmd, view, snapshot->native_size, size, fsr_settings, false);
+    Frame prepared{};
+    prepared.image = vk::Image(snapshot->prepared);
+    prepared.image_view = *snapshot->prepared_view;
+    prepared.width = size.width;
+    prepared.height = size.height;
+    pp_pass.Render(cmd, view, snapshot->native_size, prepared, pp_settings);
+    frame->hudless = std::move(snapshot);
+}
+
+void Presenter::RecordGuiFrame(Frame* frame, vk::Image source, ImTextureID texture,
+                               bool is_reusing_frame, bool screenshots) {
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
 
     const vk::Image swapchain_image = swapchain.Image();
@@ -971,7 +1142,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
-    const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
+    const u32 capture_with_overlays_count =
+        screenshots ? VideoCore::ConsumeWithOverlaysScreenshotRequests() : 0;
     std::optional<ScreenshotReadback> pending_screenshot;
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -1004,13 +1176,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 },
             },
             vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
                 .dstAccessMask = vk::AccessFlagBits::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = frame->image,
+                .image = source,
                 .subresourceRange{
                     .aspectMask = vk::ImageAspectFlagBits::eColor,
                     .baseMipLevel = 0,
@@ -1023,7 +1195,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
         bool swapchain_copied_for_screenshot = false;
 
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eColorAttachmentOutput |
                                    vk::PipelineStageFlagBits::eFragmentShader,
                                {}, {}, {}, pre_barriers);
@@ -1035,7 +1207,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
             ImGui::SetNextWindowDockID(dockId, ImGuiCond_Once);
             if (ImGui::Begin("Display##game_display", nullptr, ImGuiWindowFlags_NoNav)) {
-                auto game_texture = frame->imgui_texture;
+                auto game_texture = texture;
                 auto game_width = frame->width;
                 auto game_height = frame->height;
 
@@ -1156,34 +1328,200 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             SavePendingScreenshot(deferred_screenshot.value());
         });
     }
+}
 
+// driveclub-pc: Killzone's optical-flow FG with WSI isolated from game submissions.
+void Presenter::StartPacedPresent() {
+    if (!fg_pacer.joinable()) {
+        fg_pacer = std::thread([this] {
+            std::unique_lock lock{fg_mutex};
+            for (;;) {
+                fg_cv.wait(lock, [this] { return fg_stop || !fg_jobs.empty(); });
+                if (fg_stop)
+                    return;
+                const auto job = fg_jobs.front();
+                lock.unlock();
+                const auto work = present_scheduler.GetWorkSemaphore()->Handle();
+                const auto wait_gpu = [&](u64 tick) {
+                    const vk::SemaphoreWaitInfo info{
+                        .semaphoreCount = 1, .pSemaphores = &work, .pValues = &tick};
+                    return instance.GetDevice().waitSemaphores(
+                               info, std::numeric_limits<u64>::max()) == vk::Result::eSuccess;
+                };
+                const auto show = [&](u32 index) {
+                    if (instance.GetPacedPresentQueue())
+                        return swapchain.PresentImage(index);
+                    std::scoped_lock submit_lock{Scheduler::submit_mutex};
+                    return swapchain.PresentImage(index);
+                };
+                bool ok = wait_gpu(job.gen_tick);
+                const auto gen_at = std::chrono::steady_clock::now();
+                if (ok)
+                    ok = show(job.gen_index);
+                PreciseSleepUntil(gen_at + job.half);
+                ok &= wait_gpu(job.real_tick);
+                const auto real_at = std::chrono::steady_clock::now();
+                if (ok)
+                    ok = show(job.real_index);
+                lock.lock();
+                if (fg_real_at.time_since_epoch().count()) {
+                    fg_real_to_gen_ms +=
+                        std::chrono::duration<double, std::milli>(gen_at - fg_real_at).count();
+                }
+                fg_gen_to_real_ms +=
+                    std::chrono::duration<double, std::milli>(real_at - gen_at).count();
+                fg_real_at = real_at;
+                fg_present_count += ok ? 2 : 0;
+                ++fg_pairs;
+                fg_present_failed |= !ok;
+                fg_jobs.pop_front();
+                fg_cv.notify_all();
+            }
+        });
+    }
+    {
+        std::scoped_lock lock{fg_mutex};
+        fg_jobs.push_back(fg_next_job);
+    }
+    fg_cv.notify_all();
+}
+
+void Presenter::WaitPacedPresent() {
+    if (!fg_pacer.joinable())
+        return;
+    std::unique_lock lock{fg_mutex};
+    fg_cv.wait(lock, [this] { return fg_jobs.empty(); });
+    if (std::exchange(fg_present_failed, false) && window.GetWidth() && window.GetHeight()) {
+        lock.unlock();
+        fg_active = false;
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+}
+
+void Presenter::DumpFgPair(Frame* frame) {
+    static const std::array<double, 2> dump_at = [] {
+        const char* value = std::getenv("DCPC_FRAME_GEN_DUMP_AT");
+        const char* second = std::getenv("DCPC_FRAME_GEN_DUMP_AT2");
+        return std::array{value ? std::atof(value) : 0.0, second ? std::atof(second) : 0.0};
+    }();
+    static const auto start = std::chrono::steady_clock::now();
+    if (!fg_dump_left && fg_dump_stage < 2 && dump_at[fg_dump_stage] > 0 &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >=
+            dump_at[fg_dump_stage]) {
+        ++fg_dump_stage;
+        fg_dump_left = 8;
+    }
+    if (!fg_dump_left)
+        return;
+    auto& scheduler = present_scheduler;
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
+    std::filesystem::create_directories(dir);
+    for (int kind : {0, 1, 2}) {
+        if (kind == 2 && !frame->hudless)
+            continue;
+        const bool generated = kind == 1;
+        const vk::Image image = kind == 2   ? vk::Image(frame->hudless->prepared)
+                                : generated ? frame_gen->Output()
+                                            : frame->image;
+        ScreenshotReadback readback{instance,
+                                    ScreenshotKind::GameOnly,
+                                    {dir / fmt::format("fg-{:03}-{}.png", fg_dump_index,
+                                                       kind == 2   ? "hudless"
+                                                       : generated ? "gen"
+                                                                   : "real")},
+                                    frame->width,
+                                    frame->height,
+                                    generated ? vk::Format::eR8G8B8A8Unorm
+                                              : swapchain.GetSurfaceFormat().format,
+                                    false};
+        const vk::ImageMemoryBarrier to_copy{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_copy);
+        CopyImageToReadback(cmdbuf, image, vk::ImageLayout::eTransferSrcOptimal, readback);
+        auto restore = to_copy;
+        restore.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+        restore.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+        restore.oldLayout = vk::ImageLayout::eTransferSrcOptimal;
+        restore.newLayout = vk::ImageLayout::eGeneral;
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, restore);
+        scheduler.DeferPriorityOperation(
+            [shot = std::move(readback)]() { SavePendingScreenshot(shot); });
+    }
+    --fg_dump_left;
+    ++fg_dump_index;
+}
+
+bool Presenter::GenerateFrame(Frame* frame, bool eligible) {
+    if (!FrameGenerator::Enabled())
+        return false;
+    if (!eligible) {
+        fg_active = false;
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!frame_gen) {
+        frame_gen = std::make_unique<FrameGenerator>(instance);
+        fg_report_start = now;
+        LOG_INFO(Render_Vulkan, "driveclub-pc: optical-flow FG enabled; separate WSI queue {}",
+                 bool(instance.GetPacedPresentQueue()));
+    }
+    const float interval = std::chrono::duration<float, std::milli>(now - fg_last_real).count();
+    // driveclub-pc: after a long loading/pause gap, show a real frame instead of stretching history.
+    const bool reset = !fg_active || interval > std::max(40.0f, 2.5f * fg_interval_ms) || interval <= 0;
+    fg_last_real = now;
+    if (!reset)
+        fg_interval_ms += 0.2f * (interval - fg_interval_ms);
+    fg_active = true;
+    ++fg_real_count;
+    fg_hudless_count += bool(frame->hudless);
+    const double seconds = std::chrono::duration<double>(now - fg_report_start).count();
+    if (seconds >= 5) {
+        std::scoped_lock lock{fg_mutex};
+        LOG_INFO(Render_Vulkan,
+                 "driveclub-pc: portable FG real {:.2f}/s, presented {:.2f}/s, GPU {:.3f} ms, "
+            "gen-real {:.3f} ms, real-gen {:.3f} ms, failures {}, HUD-less {}/{}",
+                 fg_real_count / seconds, fg_present_count / seconds,
+                 frame_gen->gpu_samples ? frame_gen->gpu_ms / frame_gen->gpu_samples : 0,
+                 fg_pairs ? fg_gen_to_real_ms / fg_pairs : 0,
+            fg_pairs ? fg_real_to_gen_ms / fg_pairs : 0, frame_gen->failures,
+            fg_hudless_count, fg_real_count);
+        fg_real_count = fg_present_count = fg_pairs = 0;
+        fg_hudless_count = 0;
+        fg_gen_to_real_ms = fg_real_to_gen_ms = 0;
+        fg_report_start = now;
+        frame_gen->gpu_ms = 0;
+        frame_gen->gpu_samples = 0;
+    }
+    auto& scheduler = present_scheduler;
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::Image hudless = frame->hudless ? vk::Image(frame->hudless->prepared) : vk::Image{};
+    if (!frame_gen->Record(cmdbuf, frame->image, frame->width, frame->height, interval, reset, hudless)) {
+        return false;
+    }
+    DumpFgPair(frame);
+    // Both presents use the same viewport, host overlays and SDR color path.
+    RecordGuiFrame(frame, frame_gen->Output(), frame_gen->Texture(), true, false);
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
-    info.AddSignal(frame->present_done);
+    fg_next_job.gen_index = swapchain.ImageIndex();
+    fg_next_job.gen_tick = scheduler.CurrentTick();
+    fg_next_job.half =
+        std::chrono::microseconds(s64(std::clamp(fg_interval_ms, 4.0f, 100.0f) * 500));
     scheduler.Flush(info);
-
-    // Present to swapchain.
-    {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        const u64 hold_start =
-            DriveclubPC::Profiler::Enabled() ? DriveclubPC::Profiler::NowNs() : 0;
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        }
-        if (hold_start) {
-            DriveclubPC::Profiler::AddMax(DriveclubPC::Profiler::MaxStat::PresentHold,
-                                          DriveclubPC::Profiler::NowNs() - hold_start);
-        }
-    }
-
-    free_frame();
-    if (!is_reusing_frame && is_game_frame) {
-        DebugState.IncFlipFrameNum();
-        DriveclubPC::Performance::OnGuestFrame();
-        DriveclubPC::Profiler::OnGuestFrame();
-    }
+    swapchain.AdvanceAcquire();
+    return true;
 }
 
 Frame* Presenter::GetRenderFrame() {
@@ -1221,6 +1559,7 @@ Frame* Presenter::GetRenderFrame() {
         DriveclubPC::Profiler::AddPresentWait(DriveclubPC::Profiler::NowNs() - wait_start);
     }
 
+    frame->hudless.reset();
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);

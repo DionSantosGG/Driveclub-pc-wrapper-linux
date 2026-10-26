@@ -24,9 +24,11 @@ As I do not have a formal programming background, contributions from experienced
 Unofficial, and not affiliated with Sony Interactive Entertainment, Evolution Studios, the
 shadPS4 team or the GR2fork author. Names and trademarks belong to their owners.
 
+**Current release: 0.2.5.** See [release notes](driveclub-pc/RELEASE-0.2.5.md) for changes, installation and known limitations.
+
 ## Tested version
 
-Only **Driveclub CUSA00093 with update 1.28** has been tested. Other regions or versions may not work.
+Only **Driveclub CUSA00093 with update 1.28** has been tested. Other regions are accepted as experimental; local gameplay validation remains CUSA00093 v1.28 on NVIDIA.
 
 ## How to use
 
@@ -41,7 +43,7 @@ Only **Driveclub CUSA00093 with update 1.28** has been tested. Other regions or 
 |---|---|
 | Game folder | the base game folder (`CUSA00093`) |
 | Firmware | your `sys_modules` folder. **Import...** copies it into `user\sys_modules`, so the original can move later |
-| Frame rate | 30 / **60 (recommended)** / 120 (experimental, depends on scene and CPU temperature) |
+| Frame rate | 30 / **60 (default)** / **60 + FG** / 120 (experimental). FG generates intermediate frames for approximately 120 presentations/s; the FPS counter shows real game FPS |
 | Display / Window size | borderless fullscreen or window; the window size only applies in windowed mode (fullscreen always covers the display). Includes the ultrawide sizes 2560x1080, 3440x1440 and 5120x1440 |
 | Render resolution | **1080p (native)** / 1440p / 2160p: the number of lines the game renders (the engine's own scaling; extra video memory is set up automatically). The width follows the aspect ratio of the display (fullscreen) or window, see *Ultrawide* below. 1440p costs about 10–15 % FPS; 2160p is very demanding |
 | Upscaling / Sharpening | AMD FSR 1 or bilinear; RCAS sharpening off / normal / strong |
@@ -50,13 +52,14 @@ Only **Driveclub CUSA00093 with update 1.28** has been tested. Other regions or 
 | Prefer performance cores | on by default; keeps the busiest threads on P-cores of hybrid Intel CPUs |
 | Compile shaders in the background | on by default: new shaders and pipelines are built off the main thread, so first-time content does not freeze the game (an object may appear a few frames late). Turn off if you see graphics errors |
 | GPU readbacks | **Precise (default)**. Relaxed is faster but causes shadow and vegetation glitches; Off makes the 3D world nearly black |
+| Save-data root | choose a custom save location, open it, or restore the default; existing saves are never moved automatically |
 | Classic PS4 frame pacing | fallback: only turn it on if game speed feels wrong |
 | Show this window at start | if turned off, the game starts directly; hold **Shift** while launching to open the window again |
 
 4. Press **Play**. Before the game boots, the launcher checks the folder, the title ID, the update
    version and the firmware, and explains any problem it finds.
 
-The game's own clock runs in real time: race times are correct at 120 FPS as well, and physics don't speed up.
+The 60 FPS mode supports the original v1.28 executable. The 120 FPS mode remains experimental, including game timing and achievable frame rate.
 
 **Ultrawide:** on a display or window wider than 16:9 the game renders a native wide image: the
 scene itself is rendered at the wide size (e.g. 3440x1440 at 1440p, nothing is stretched) with a
@@ -68,15 +71,15 @@ Tested in scripted races and screenshots, not yet on a real ultrawide monitor.
 **60 FPS with an unmodified 1.28 executable:** the game no longer runs too fast; the fix is applied
 in memory and leaves already-modified executables alone.
 
-**Data:** settings, saves, shader cache and logs are all kept in the `user` folder next to the
-executable. Keep that folder when you update to a new release. The log of the last run is
+**Data:** settings, shader cache, logs and default saves are kept in the `user` folder next to the
+executable. A custom save-data root can be selected in the launcher. Keep that folder when you update to a new release. The log of the last run is
 `user\log\shad_log.txt`.
 
 **Controls:** gamepad through SDL, the same as shadPS4/GR2fork.
 
 ## What it changes
 
-Compared with GR2fork, this fork adds a Driveclub launcher with settings, 30/60/120 FPS targets,
+Compared with GR2fork, this fork adds a Driveclub launcher with settings, 30/60/60 + FG/120 FPS modes,
 FXAA/SMAA and anisotropic filtering, stability fixes, and CPU-side speedups of the emulated GPU
 command processor. Full list: [driveclub-pc/CHANGES.md](driveclub-pc/CHANGES.md).
 
@@ -111,7 +114,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
 cmake --build build --parallel
 ```
 
-Release builds also use profile-guided optimisation, which adds about 10 %.
+The 0.2.5 release uses Release + ThinLTO with a fresh PGO profile. To reproduce the packaged build, use the corresponding source ZIP attached to the release; it includes the profile, dependency inventory and build script. The commands above build from source without the release PGO profile.
 
 ## Credits
 
@@ -123,7 +126,7 @@ Release builds also use profile-guided optimisation, which adds about 10 %.
   (GPL-2.0-or-later): the aspect ratio, video-out width and FOV values the ultrawide support starts from.
 - [SMAA](https://github.com/iryoku/smaa) by Jorge Jimenez et al., MIT licence
   ([driveclub-pc/SMAA-LICENSE.txt](driveclub-pc/SMAA-LICENSE.txt)).
-- AMD FidelityFX FSR 1, already part of shadPS4.
+- AMD FidelityFX FSR 1, already part of shadPS4, and optional native Vulkan Optical Flow / Frame Interpolation adapted from the local Killzone port; provenance and license notices are in [externals/fsr-vulkan](externals/fsr-vulkan).
 - The libraries in `externals/` (git submodules), each under its own licence.
 
 ## Licence

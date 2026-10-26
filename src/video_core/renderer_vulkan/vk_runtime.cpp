@@ -11,6 +11,7 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
+#include <cstdlib>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
@@ -466,8 +467,47 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         blit_helper->ReinterpretColorAsMsDepth(
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
+    } else if (src->info.pixel_format == vk::Format::eD32Sfloat && src->info.num_samples == 4 &&
+               dst->info.pixel_format == vk::Format::eR32G32B32A32Sfloat &&
+               dst->info.num_samples == 1 &&
+               bool(src->supported_samples & vk::SampleCountFlagBits::e4) &&
+               src->info.size == dst->info.size && src->info.size.depth == 1 &&
+               src->info.resources.levels == 1 && dst->info.resources.levels == 1 &&
+               src->info.resources.layers == 1 && dst->info.resources.layers == 1 && [] {
+                   const auto* env = std::getenv("DCPC_MS_DEPTH_COPY");
+                   return !env || env[0] != '0';
+               }()) {
+        // driveclub-pc: inverse of the channel-to-sample path above, never an averaged resolve.
+        scheduler.EndRendering();
+        SetBackingSamples(src, 4);
+        SetBackingSamples(dst, 1, false);
+        bool needs_flush =
+            Transit(src, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+        needs_flush |= Transit(dst, vk::ImageLayout::eColorAttachmentOptimal,
+                               vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                               vk::AccessFlagBits2::eColorAttachmentWrite);
+        if (needs_flush) {
+            FlushBarriers();
+        }
+        blit_helper->ReinterpretMsDepthAsColor(dst->info.size.width, dst->info.size.height,
+                                               src->info.pixel_format, dst->info.pixel_format,
+                                               src->GetImage(), dst->GetImage());
+        dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+        dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+        static bool logged = false;
+        if (!logged) {
+            LOG_INFO(Render_Vulkan, "driveclub-pc: preserving four MSAA depth samples as RGBA");
+            logged = true;
+        }
     } else {
-        LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+        // driveclub-pc: retain the unresolved copy's actual formats/sample counts for diagnosis.
+        LOG_WARNING(Render_Vulkan,
+                    "Unimplemented depth overlap copy: {}x{} {} samples={} -> {}x{} {} samples={}",
+                    src->info.size.width, src->info.size.height,
+                    vk::to_string(src->info.pixel_format), src->info.num_samples,
+                    dst->info.size.width, dst->info.size.height,
+                    vk::to_string(dst->info.pixel_format), dst->info.num_samples);
     }
 }
 

@@ -23,13 +23,25 @@ constexpr std::string_view AppName = "Driveclub-PC";
 std::optional<std::filesystem::path> ResolveAndValidateGame(const std::filesystem::path& arg,
                                                             std::string& error);
 
-// Firmware modules are the user's own (never shipped). Driveclub needs libSceLibcInternal.sprx.
-bool ValidateSysModules(std::string& error);
+// driveclub-pc: read the selected region for configs, saves and firmware overrides.
+std::optional<std::string> ReadGameTitleId(const std::filesystem::path& eboot_or_folder);
+std::string GameCompatibilityNote(std::string_view title_id);
+
+struct FirmwareReport {
+    bool ready = false;
+    std::string summary;
+    std::string details;
+};
+FirmwareReport InspectSysModules(std::string_view title_id = TitleId);
+
+// Firmware modules are the user's own (never shipped). InspectSysModules distinguishes required
+// modules from observed optional modules with an HLE fallback, and checks basic file headers.
+bool ValidateSysModules(std::string& error, std::string_view title_id = TitleId);
 
 // Writes the Driveclub per-game settings once, when the user has none: the GPU readback settings
 // recommended for the game (Precise/readbacks_mode=2, readback_offload=true), FSR 1 + RCAS, and
 // borderless fullscreen at the primary display's resolution.
-void EnsureDefaultGameConfig();
+void EnsureDefaultGameConfig(std::string_view title_id = TitleId);
 
 void ShowError(std::string_view message);
 

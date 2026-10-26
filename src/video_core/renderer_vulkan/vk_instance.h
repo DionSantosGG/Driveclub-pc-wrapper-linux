@@ -75,6 +75,10 @@ public:
         return present_queue;
     }
 
+    vk::Queue GetPacedPresentQueue() const { return paced_present_queue; }
+    bool IsSubgroupSizeControlEnabled() const { return vk13_features.subgroupSizeControl; }
+    bool CanWriteStorageWithoutFormat() const { return features.shaderStorageImageWriteWithoutFormat; }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -242,9 +246,16 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
-    /// Returns true if the subgroup size can be set to match guest subgroup size
+    // driveclub-pc: maxSubgroupSize alone does not permit requiring 64 in every stage.
+    bool CanRequireSubgroupSize64(vk::ShaderStageFlagBits stage) const {
+        return vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 64 &&
+               vk13_props.maxSubgroupSize >= 64 &&
+               bool(vk13_props.requiredSubgroupSizeStages & stage);
+    }
+
+    /// Returns true if compute can be pinned to the guest wave size.
     bool IsSubgroupSize64Supported() const {
-        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+        return CanRequireSubgroupSize64(vk::ShaderStageFlagBits::eCompute);
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
@@ -345,8 +356,13 @@ public:
         return properties.limits.nonCoherentAtomSize;
     }
 
-    /// Returns the subgroup size of the selected physical device.
+    /// Returns the subgroup width selected for compute shader compilation and execution.
     u32 SubgroupSize() const {
+        // driveclub-pc: LowerWave64BallotPass must target the width actually used by compute.
+        return IsSubgroupSize64Supported() ? 64 : vk11_props.subgroupSize;
+    }
+
+    u32 DefaultSubgroupSize() const {
         return vk11_props.subgroupSize;
     }
 
@@ -515,6 +531,7 @@ private:
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
     VmaAllocator allocator{};
+    vk::Queue paced_present_queue;
     vk::Queue present_queue;
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;

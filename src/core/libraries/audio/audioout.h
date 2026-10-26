@@ -123,6 +123,7 @@ struct PortOut {
 
     void* output_buffer = nullptr;
     std::condition_variable_any output_cv;
+    std::condition_variable_any input_cv; // driveclub-pc: wake the worker when PCM arrives
     bool output_ready = false;
     bool closing = false;
     Kernel::Thread output_thread{};

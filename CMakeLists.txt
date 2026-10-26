@@ -1354,6 +1354,10 @@ add_executable(shadps4
     src/driveclub/fps_unlock.h
     src/driveclub/render_res.cpp
     src/driveclub/render_res.h
+    src/driveclub/shader_fixes.cpp
+    src/driveclub/shader_fixes.h
+    src/driveclub/audio_queue.h
+    src/driveclub/audio_stats.h
     src/driveclub/widescreen.cpp
     src/driveclub/widescreen.h
     src/driveclub/autopilot.h
@@ -1381,6 +1385,27 @@ set_target_properties(shadps4 PROPERTIES OUTPUT_NAME "Driveclub-PC")
 
 create_target_directory_groups(shadps4)
 
+# driveclub-pc: Killzone's native Vulkan FSR 3 FG, independent of upscaling.
+if(WIN32 AND NOT TARGET Vulkan::Vulkan)
+    set(DCPC_VULKAN_IMPLIB "${CMAKE_CURRENT_BINARY_DIR}/vulkan-1.lib")
+    if(NOT EXISTS "${DCPC_VULKAN_IMPLIB}")
+        execute_process(COMMAND lib /nologo /machine:x64
+            "/def:${CMAKE_CURRENT_SOURCE_DIR}/externals/vulkan-loader/loader/vulkan-1.def"
+            "/out:${DCPC_VULKAN_IMPLIB}" COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+    add_library(Vulkan::Vulkan INTERFACE IMPORTED)
+    set_target_properties(Vulkan::Vulkan PROPERTIES
+        INTERFACE_LINK_LIBRARIES "${DCPC_VULKAN_IMPLIB};Vulkan::Headers")
+endif()
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(externals/fsr-vulkan EXCLUDE_FROM_ALL)
+target_sources(shadps4 PRIVATE src/video_core/renderer_vulkan/vk_frame_gen.cpp
+    src/video_core/renderer_vulkan/vk_hudless_capture.cpp)
+target_link_libraries(shadps4 PRIVATE ffx-vulkan::portable)
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis SDL3::SDL3 pugixml::pugixml)

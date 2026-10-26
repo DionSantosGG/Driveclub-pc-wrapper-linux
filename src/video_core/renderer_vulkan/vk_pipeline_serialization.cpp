@@ -299,7 +299,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = CompileSPV(spv, instance.GetDevice(), program->info.pgm_hash);
         it_pgm.value() = std::move(program);
     } else {
         // The permutation joins the cached program; its spec must point at that program's info,
@@ -320,7 +320,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
             }
             module = it->module;
         } else {
-            module = CompileSPV(spv, instance.GetDevice());
+            module = CompileSPV(spv, instance.GetDevice(), program->info.pgm_hash);
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
@@ -336,7 +336,10 @@ void PipelineCache::WarmUp() {
         return;
     }
 
-    Storage::DataBase::Instance().Open();
+    // driveclub-pc: an old default-wave32 profile cannot be reused for pinned wave64 compute.
+    Storage::DataBase::Instance().Open(instance.SubgroupSize() != instance.DefaultSubgroupSize()
+                                         ? "-dcpc-wave64"
+                                         : "");
 
     // Check if cache is compatible
     std::vector<u8> profile_data{};

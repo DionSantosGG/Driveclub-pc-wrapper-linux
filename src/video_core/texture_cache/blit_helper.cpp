@@ -10,6 +10,7 @@
 
 #include "video_core/host_shaders/color_to_ms_depth_frag.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
+#include "video_core/host_shaders/ms_depth_pack_frag.h"
 #include "video_core/host_shaders/ms_image_blit_frag.h"
 #include "video_core/host_shaders/ms_image_blit_msaa_frag.h"
 
@@ -44,6 +45,7 @@ BlitHelper::~BlitHelper() {
     device.destroy(color_to_ms_depth_frag);
     device.destroy(src_msaa_copy_frag);
     device.destroy(src_non_msaa_copy_frag);
+    device.destroy(ms_depth_pack_frag);
 }
 
 void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_samples,
@@ -119,7 +121,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 
-    const MsPipelineKey key{num_samples, dst_pixel_format, false};
+    const MsPipelineKey key{num_samples, dst_pixel_format, CopyMode::SingleSample};
     auto it = std::ranges::find(color_to_ms_depth_pl, key, &MsPipeline::first);
     if (it == color_to_ms_depth_pl.end()) {
         CreateColorToMSDepthPipeline(key);
@@ -153,14 +155,29 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
 void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
                                      vk::Format pixel_format, bool src_msaa, vk::Image source,
                                      vk::Image dest) {
+    CopyToColor(width, height, num_samples, pixel_format, pixel_format,
+                src_msaa ? CopyMode::Multisample : CopyMode::SingleSample, source, dest);
+}
+
+void BlitHelper::ReinterpretMsDepthAsColor(u32 width, u32 height, vk::Format src_pixel_format,
+                                           vk::Format dst_pixel_format, vk::Image source,
+                                           vk::Image dest) {
+    CopyToColor(width, height, 1, src_pixel_format, dst_pixel_format, CopyMode::PackDepthSamples,
+                source, dest);
+}
+
+void BlitHelper::CopyToColor(u32 width, u32 height, u32 num_samples, vk::Format src_pixel_format,
+                             vk::Format dst_pixel_format, CopyMode mode, vk::Image source,
+                             vk::Image dest) {
     const vk::ImageViewUsageCreateInfo src_usage_ci{.usage = vk::ImageUsageFlagBits::eSampled};
     const vk::ImageViewCreateInfo src_view_ci = {
         .pNext = &src_usage_ci,
         .image = source,
         .viewType = vk::ImageViewType::e2D,
-        .format = pixel_format,
+        .format = src_pixel_format,
         .subresourceRange{
-            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .aspectMask = mode == CopyMode::PackDepthSamples ? vk::ImageAspectFlagBits::eDepth
+                                                             : vk::ImageAspectFlagBits::eColor,
             .baseMipLevel = 0U,
             .levelCount = 1U,
             .baseArrayLayer = 0U,
@@ -177,7 +194,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .pNext = &dst_usage_ci,
         .image = dest,
         .viewType = vk::ImageViewType::e2D,
-        .format = pixel_format,
+        .format = dst_pixel_format,
         .subresourceRange{
             .aspectMask = vk::ImageAspectFlagBits::eColor,
             .baseMipLevel = 0U,
@@ -222,7 +239,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 
-    const MsPipelineKey key{num_samples, pixel_format, src_msaa};
+    const MsPipelineKey key{num_samples, dst_pixel_format, mode};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
     if (it == ms_image_copy_pl.end()) {
         CreateMsCopyPipeline(key);
@@ -258,6 +275,7 @@ void BlitHelper::CreateShaders() {
     fs_tri_vertex = Vulkan::CompileSPV(FS_TRI_VERT, device);
     color_to_ms_depth_frag = Vulkan::CompileSPV(COLOR_TO_MS_DEPTH_FRAG, device);
     src_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_MSAA_FRAG, device);
+    ms_depth_pack_frag = Vulkan::CompileSPV(MS_DEPTH_PACK_FRAG, device);
     src_non_msaa_copy_frag = Vulkan::CompileSPV(MS_IMAGE_BLIT_FRAG, device);
 }
 
@@ -385,7 +403,9 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
     };
     shader_stages[1] = {
         .stage = vk::ShaderStageFlagBits::eFragment,
-        .module = key.src_msaa ? src_msaa_copy_frag : src_non_msaa_copy_frag,
+        .module = key.mode == CopyMode::PackDepthSamples ? ms_depth_pack_frag
+                  : key.mode == CopyMode::Multisample    ? src_msaa_copy_frag
+                                                         : src_non_msaa_copy_frag,
         .pName = "main",
     };
 

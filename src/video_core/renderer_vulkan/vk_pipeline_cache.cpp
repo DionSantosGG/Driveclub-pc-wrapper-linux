@@ -1792,9 +1792,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
+        module = CompileSPV(*patch, instance.GetDevice(), info.pgm_hash);
     } else {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = CompileSPV(spv, instance.GetDevice(), info.pgm_hash);
     }
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
@@ -2369,7 +2369,7 @@ void PipelineCache::RunAsyncShaderJob(AsyncShaderJob& job) const {
         Shader::TranslateProgram(job.code, job_pools, info, *job.runtime_info, profile);
     info.ResolveDirectReads();
     job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, *job.runtime_info, ir_program, binding);
-    job.module = CompileSPV(job.spv, instance.GetDevice());
+    job.module = CompileSPV(job.spv, instance.GetDevice(), info.pgm_hash);
     // Specialise from the same guest memory the translation just read, so the module and its
     // specialization agree even if the game rewrote the descriptors after the draw.
     info.RefreshFlatBuf();

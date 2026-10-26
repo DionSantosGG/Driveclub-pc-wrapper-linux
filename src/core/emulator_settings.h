@@ -947,6 +947,9 @@ public:
 
     std::filesystem::path GetHomeDir();
     void SetHomeDir(const std::filesystem::path& dir);
+    // driveclub-pc: launcher override for saves only; trophies and user profiles stay in home.
+    std::filesystem::path GetSaveDataHome();
+    void SetSaveDataHome(const std::filesystem::path& dir);
     std::filesystem::path GetSysModulesDir();
     void SetSysModulesDir(const std::filesystem::path& dir);
     std::filesystem::path GetFontsDir();
@@ -955,6 +958,7 @@ public:
     void SetAddonInstallDir(const std::filesystem::path& dir);
 
 private:
+    std::filesystem::path m_save_data_home;
     GeneralSettings m_general{};
     NetworkSettings m_network{};
     LogSettings m_log{};

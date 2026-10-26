@@ -33,6 +33,9 @@ public:
 
     /// Presents the current image and move to the next one
     bool Present();
+    bool PresentImage(u32 index);
+    u32 ImageIndex() const { return image_index; }
+    void AdvanceAcquire() { frame_index = (frame_index + 1) % image_count; }
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

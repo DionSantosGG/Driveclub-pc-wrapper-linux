@@ -16,6 +16,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -381,16 +382,25 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // driveclub-pc: WSI can block; keep FG presents off the game's submit queue.
+    const bool separate_present = FrameGenerator::Enabled() &&
+                                  family_properties[queue_family_index].queueCount >= 2;
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = separate_present ? 2u : 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    // driveclub-pc: record the native width, selected compute width and legal stage mask.
+    LOG_INFO(Render_Vulkan,
+             "driveclub-pc: subgroup default {}, range {}-{}, required stages {:#x}, compute {}",
+             DefaultSubgroupSize(), vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize,
+             static_cast<u32>(static_cast<VkShaderStageFlags>(vk13_props.requiredSubgroupSizeStages)),
+             SubgroupSize());
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -421,6 +431,7 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                .shaderStorageImageWriteWithoutFormat = features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -604,6 +615,9 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (separate_present) {
+        paced_present_queue = device->getQueue(queue_family_index, 1);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

@@ -187,6 +187,14 @@ void EmulatorSettingsImpl::SetHomeDir(const std::filesystem::path& dir) {
     m_general.home_dir.value = dir;
 }
 
+std::filesystem::path EmulatorSettingsImpl::GetSaveDataHome() {
+    return m_save_data_home.empty() ? GetHomeDir() : m_save_data_home;
+}
+
+void EmulatorSettingsImpl::SetSaveDataHome(const std::filesystem::path& dir) {
+    m_save_data_home = dir;
+}
+
 std::filesystem::path EmulatorSettingsImpl::GetSysModulesDir() {
     if (m_general.sys_modules_dir.value.empty()) {
         return Common::FS::GetUserPath(Common::FS::PathType::SysModuleDir);

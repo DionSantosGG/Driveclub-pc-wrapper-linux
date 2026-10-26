@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/vk_frame_gen.h"
 
 namespace Vulkan {
 
@@ -130,23 +131,29 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    const bool result = PresentImage(image_index);
+    AdvanceAcquire();
+    return result;
+}
+
+bool Swapchain::PresentImage(u32 index) {
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &present_ready[image_index],
+        .pWaitSemaphores = &present_ready[index],
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
-        .pImageIndices = &image_index,
+        .pImageIndices = &index,
     };
 
-    auto result = instance.GetPresentQueue().presentKHR(present_info);
+    const auto queue = instance.GetPacedPresentQueue() ? instance.GetPacedPresentQueue()
+                                                       : instance.GetPresentQueue();
+    auto result = queue.presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
                    vk::to_string(result));
     }
-
-    frame_index = (frame_index + 1) % image_count;
 
     return !needs_recreation;
 }
@@ -237,7 +244,7 @@ void Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    image_count = capabilities.minImageCount + (FrameGenerator::Enabled() ? 3 : 1);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

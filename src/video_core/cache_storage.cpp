@@ -87,19 +87,21 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
-void DataBase::Open() {
+void DataBase::Open(std::string_view suffix) {
     if (opened) {
         return;
     }
 
     const auto& game_info = Common::ElfInfo::Instance();
+    // driveclub-pc: preserve old wave32-lowered shaders when compute now really runs wave64.
+    const auto cache_name = std::string(game_info.GameSerial()) + std::string(suffix);
 
     using namespace Common::FS;
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
-                     std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
+                     std::filesystem::path{cache_name}.replace_extension(".zip");
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -110,7 +112,7 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
+        cache_path = GetUserPath(PathType::CacheDir) / cache_name;
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

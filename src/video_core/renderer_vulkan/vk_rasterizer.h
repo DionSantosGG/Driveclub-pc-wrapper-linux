@@ -29,6 +29,8 @@ SHAD_NO_INLINE void BindAssertFailed();
 
 class GraphicsPipeline;
 class Runtime;
+class HudlessCapture;
+struct HudlessSnapshot;
 
 class Rasterizer {
 public:
@@ -52,6 +54,8 @@ public:
         return texture_cache;
     }
 
+    void RegisterFgVideoOut(VAddr address);
+    std::shared_ptr<HudlessSnapshot> TakeHudless(VAddr address);
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -444,6 +448,7 @@ private:
 
     friend class VideoCore::BufferCache;
 
+    std::unique_ptr<HudlessCapture> hudless_capture;
     const Instance& instance;
     Scheduler& scheduler;
     Runtime& runtime;

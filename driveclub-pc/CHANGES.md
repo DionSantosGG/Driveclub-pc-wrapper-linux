@@ -1,5 +1,17 @@
 # Changes compared with GR2fork
 
+## v0.2.5 (21.10.2026)
+
+- Four frame-rate modes: 30, 60, 60 + FG, experimental 120.
+- Optional native Vulkan frame generation with pre-HUD scene capture, paced
+  generated/real presentation and corrected output opacity. Fast-motion artifacts remain.
+- Custom save-data root, regional validation and clearer firmware diagnostics.
+- Higher-resolution shader bounds, subgroup width and multisampled depth conversion fixes.
+- OpenAL/SDL packet delivery, prebuffering and queue handling fixes.
+- Fresh Release + ThinLTO + PGO build from runtime commit `4ebedc6`.
+- Water spray/smoke/flare flicker, replay shake and experimental 120 FPS timing remain open.
+- Full changes and validation limits: [RELEASE-0.2.5.md](RELEASE-0.2.5.md).
+
 ## v0.2.1
 
 - **Ultrawide** support for displays and windows wider than 16:9 (window sizes 2560x1080,

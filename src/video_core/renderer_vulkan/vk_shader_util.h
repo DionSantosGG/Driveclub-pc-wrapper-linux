@@ -15,6 +15,6 @@ namespace Vulkan {
  * @param code The SPIR-V bytecode data.
  * @param device The vulkan device handle
  */
-vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device);
+vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, u64 guest_hash = 0);
 
 } // namespace Vulkan
